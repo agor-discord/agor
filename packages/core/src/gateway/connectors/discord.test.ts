@@ -465,8 +465,8 @@ describe('Discord connector beta', () => {
       mentions: [{ id: config.application_id }],
     };
     for (const [allowedRoles, expected] of [
-      [config.allowed_role_ids, 0],
-      [[config.guild_id], 2],
+      [config.allowed_role_ids, []],
+      [[config.guild_id], ['888888888888888888', '888888888888888889']],
     ] as const) {
       const { transport, dispatch } = makeTransport();
       const connector = new DiscordConnector(
@@ -504,7 +504,12 @@ describe('Discord connector beta', () => {
         0
       );
       await (connector as unknown as { dispatchChain: Promise<void> }).dispatchChain;
-      expect(received).toHaveLength(expected);
+      expect(
+        received.map(
+          (message) =>
+            (message as { metadata: { discord_message_id: string } }).metadata.discord_message_id
+        )
+      ).toEqual(expected);
       await connector.stopListening();
     }
   });
