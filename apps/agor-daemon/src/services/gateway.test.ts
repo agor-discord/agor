@@ -3377,6 +3377,14 @@ describe('GatewayService Discord beta routing', () => {
     };
 
     await expect(harness.service.create(inbound)).resolves.toMatchObject({ success: true });
+    // The first in-thread read includes the starter: a forum post's opener lives in the post.
+    expect(connector.fetchProviderHistory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: '723456789012345678',
+        afterProviderCursor: '723456789012345677',
+        throughProviderCursor: '923456789012345678',
+      })
+    );
     const prompt = harness.promptCreate.mock.calls[0][0].prompt as string;
     expect(prompt).toContain('ambient context');
     expect(prompt).toContain('hello');

@@ -1,5 +1,5 @@
 import type { ResponseLike } from '@discordjs/rest';
-import { GatewayCloseCodes, GatewayIntentBits } from 'discord-api-types/v10';
+import { GatewayCloseCodes, GatewayIntentBits, PermissionFlagsBits } from 'discord-api-types/v10';
 import { describe, expect, it, vi } from 'vitest';
 import {
   type DiscordMessageDeliveryID,
@@ -1833,5 +1833,249 @@ describe('Discord agent channel history', () => {
         channelId: parentId,
       })
     ).rejects.toMatchObject({ kind: 'rate_limit' });
+  });
+});
+
+describe('Discord forum channels', () => {
+  const forumId = config.allowed_channel_ids[0];
+  // A forum cannot be the default proactive target, so the listener tests drop it.
+  const forumConfig = { ...config, default_outbound_target: undefined };
+  const postId = '888888888888888888';
+  const tagId = '121212121212121212';
+  const replyPermissions = String(
+    PermissionFlagsBits.ViewChannel |
+      PermissionFlagsBits.ReadMessageHistory |
+      PermissionFlagsBits.SendMessagesInThreads
+  );
+  const post = (id: string, parentId = forumId) => ({
+    id,
+    guild_id: config.guild_id,
+    parent_id: parentId,
+    type: 11,
+    name: `Post ${id.slice(-2)}`,
+    owner_id: '444444444444444444',
+    applied_tags: [tagId],
+    message_count: 3,
+    last_message_id: '999999999999999999',
+    thread_metadata: {
+      archived: false,
+      locked: false,
+      create_timestamp: '2026-10-03T12:00:00.000Z',
+    },
+  });
+
+  function forumTransport(forum: Record<string, unknown> = {}) {
+    const harness = makeTransport();
+    harness.rest.get.mockImplementation(async (route: string) => {
+      if (route.startsWith('/users/')) return { id: config.application_id, username: 'Agor' };
+      if (route.includes('/gateway/bot')) return { shards: 1 };
+      if (route.includes('/oauth2/applications/@me')) return { flags: '524288' };
+      if (route.includes('/members/'))
+        return { user: { id: config.application_id }, roles: [], permissions: replyPermissions };
+      if (route === `/guilds/${config.guild_id}/threads/active`) {
+        return {
+          threads: [
+            post('777777777777777771'),
+            post(postId),
+            post('777777777777777772', '313131313131313131'),
+          ],
+        };
+      }
+      if (route.startsWith(`/channels/${forumId}/threads/archived/public`)) {
+        return {
+          has_more: true,
+          threads: [
+            {
+              ...post('777777777777777773'),
+              thread_metadata: {
+                archived: true,
+                locked: true,
+                archive_timestamp: '2026-10-01T00:00:00.000Z',
+              },
+            },
+          ],
+        };
+      }
+      if (route === `/channels/${postId}/messages/${postId}`) {
+        return { id: postId, channel_id: postId };
+      }
+      if (route.startsWith(`/channels/${postId}/messages`)) return [];
+      if (route === `/channels/${postId}`) return post(postId);
+      if (route === `/channels/${forumId}`) {
+        return {
+          id: forumId,
+          guild_id: config.guild_id,
+          type: 15,
+          available_tags: [{ id: tagId, name: 'bug' }],
+          ...forum,
+        };
+      }
+      return {
+        id: config.guild_id,
+        name: 'Guild',
+        roles: [{ id: config.guild_id, permissions: '0' }],
+      };
+    });
+    return harness;
+  }
+
+  it('admits a mention in a forum post, verifies its starter inside the post, and replies there', async () => {
+    const { transport, rest, dispatch } = forumTransport();
+    const connector = new DiscordConnector(forumConfig, transport as never);
+    const received: unknown[] = [];
+    await connector.startListening(async (message) => {
+      received.push(message);
+    });
+    dispatch()?.(
+      {
+        t: 'MESSAGE_CREATE',
+        s: 1,
+        d: {
+          id: '999999999999999999',
+          guild_id: config.guild_id,
+          channel_id: postId,
+          type: 0,
+          content: `<@${config.application_id}> any ideas?`,
+          author: { id: '444444444444444444', bot: false },
+          member: { roles: [] },
+          mentions: [{ id: config.application_id }],
+        },
+      },
+      0
+    );
+    await (connector as unknown as { dispatchChain: Promise<void> }).dispatchChain;
+
+    expect(received[0]).toMatchObject({
+      text: 'any ideas?',
+      threadId: `discord:thread:${forumId}:${postId}`,
+    });
+    const prepared = await (
+      received[0] as { prepareDelivery: () => Promise<Record<string, unknown>> }
+    ).prepareDelivery();
+    expect(prepared).toMatchObject({
+      discord_thread_id: postId,
+      discord_thread: {
+        parent_channel_id: forumId,
+        thread_channel_id: postId,
+        starter_message_id: postId,
+      },
+    });
+    expect(rest.get).toHaveBeenCalledWith(`/channels/${postId}/messages/${postId}`);
+    expect(rest.get).not.toHaveBeenCalledWith(`/channels/${forumId}/messages/${postId}`);
+
+    await connector.sendMessage({
+      threadId: `discord:thread:${forumId}:${postId}`,
+      text: 'try this',
+    });
+    expect(rest.post).toHaveBeenCalledWith(
+      `/channels/${postId}/messages`,
+      expect.objectContaining({ body: expect.objectContaining({ content: 'try this' }) })
+    );
+    await connector.stopListening();
+  });
+
+  it('still refuses a forum that @everyone cannot view', async () => {
+    const { transport } = forumTransport({
+      permission_overwrites: [
+        { id: config.guild_id, type: 0, deny: String(PermissionFlagsBits.ViewChannel) },
+      ],
+    });
+    const connector = new DiscordConnector(forumConfig, transport as never);
+    await expect(connector.startListening(vi.fn())).rejects.toMatchObject({
+      code: 'discord_channel_invalid',
+      remediation: expect.stringContaining('public text or forum channel'),
+    });
+  });
+
+  it('refuses to listen when the default proactive target is a forum', async () => {
+    const { transport } = forumTransport();
+    await expect(
+      new DiscordConnector(config, transport as never).startListening(vi.fn())
+    ).rejects.toMatchObject({ code: 'discord_outbound_target_invalid' });
+  });
+
+  it('probes a forum with reply permissions and flags a forum proactive target', async () => {
+    const { transport } = forumTransport();
+    const result = await new DiscordConnector(config, transport as never).testConnection();
+
+    expect(result.channelAccess).toEqual([
+      expect.objectContaining({ channelId: forumId, kind: 'forum', ok: true }),
+    ]);
+    expect(result.failures).toEqual([expect.objectContaining({ capability: 'outbound_target' })]);
+    const textOnly = await new DiscordConnector(forumConfig, transport as never).testConnection();
+    expect(textOnly.ok).toBe(true);
+  });
+
+  it('reads a post (also by default from its session), refuses the forum itself, and lists posts', async () => {
+    const { transport, rest } = forumTransport();
+    const connector = new DiscordConnector(config, transport as never);
+
+    await expect(connector.fetchChannelHistory({ channelId: postId })).resolves.toMatchObject({
+      channelId: postId,
+      messages: [],
+    });
+    await expect(
+      connector.fetchChannelHistory({ sessionThreadKey: `discord:thread:${forumId}:${postId}` })
+    ).resolves.toMatchObject({ channelId: postId });
+    await expect(connector.fetchChannelHistory({ channelId: forumId })).rejects.toThrow(
+      'is a forum, which has no messages of its own'
+    );
+    expect(rest.get).not.toHaveBeenCalledWith(
+      expect.stringMatching(`^/channels/${forumId}/messages`)
+    );
+
+    const active = await connector.listForumPosts({
+      sessionThreadKey: `discord:thread:${forumId}:${postId}`,
+      limit: 1,
+    });
+    expect(active.posts.map((p) => p.id)).toEqual([postId]);
+    expect(active.posts[0]).toMatchObject({
+      reply_count: 3,
+      title: 'Post 88',
+      tags: [{ id: tagId, name: 'bug' }],
+      author_id: '444444444444444444',
+      created_at: '2026-10-03T12:00:00.000Z',
+      archived: false,
+    });
+    expect(active).toMatchObject({ has_more: true, next_cursor: { before: postId } });
+    const next = await connector.listForumPosts({ channelId: forumId, before: postId });
+    expect(next.posts.map((p) => p.id)).toEqual(['777777777777777771']);
+    expect(next).toMatchObject({ has_more: false, next_cursor: null });
+
+    const archived = await connector.listForumPosts({
+      channelId: forumId,
+      archived: true,
+      before: '2026-10-02T00:00:00.000Z',
+    });
+    expect(rest.get).toHaveBeenCalledWith(
+      `/channels/${forumId}/threads/archived/public?limit=25&before=2026-10-02T00%3A00%3A00.000Z`
+    );
+    expect(archived.posts[0]).toMatchObject({
+      archived: true,
+      locked: true,
+      archived_at: '2026-10-01T00:00:00.000Z',
+    });
+    expect(archived.next_cursor).toEqual({ before: '2026-10-01T00:00:00.000Z' });
+
+    // Discord's archive route rejects page sizes below 2, so a limit of 1 asks for 2.
+    await connector.listForumPosts({ channelId: forumId, archived: true, limit: 1 });
+    expect(rest.get).toHaveBeenCalledWith(`/channels/${forumId}/threads/archived/public?limit=2`);
+  });
+
+  it('refuses to list posts of a text channel or with a cursor of the wrong kind', async () => {
+    const { transport, rest } = makeTransport();
+    const connector = new DiscordConnector(config, transport as never);
+    await expect(connector.listForumPosts({ channelId: forumId })).rejects.toThrow(
+      'is not a forum channel'
+    );
+    // The kind is refused before the guild and bot-member permission lookups.
+    expect(rest.get).not.toHaveBeenCalledWith(`/guilds/${config.guild_id}`);
+    const forum = forumTransport();
+    const forumConnector = new DiscordConnector(config, forum.transport as never);
+    for (const before of [postId, 'March 2026', '1']) {
+      await expect(
+        forumConnector.listForumPosts({ channelId: forumId, archived: true, before })
+      ).rejects.toThrow('Archived forum posts page by an ISO archive timestamp cursor');
+    }
   });
 });

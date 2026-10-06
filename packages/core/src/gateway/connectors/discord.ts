@@ -12,6 +12,7 @@ import { REST, type RESTOptions } from '@discordjs/rest';
 import { WebSocketManager, WebSocketShardEvents } from '@discordjs/ws';
 import {
   ApplicationFlags,
+  ChannelType as DiscordChannelType,
   GatewayCloseCodes,
   GatewayDispatchEvents,
   type GatewayDispatchPayload,
@@ -22,12 +23,15 @@ import {
 import type {
   ChannelType,
   DiscordAgentChannelHistoryRequest,
+  DiscordAgentForumPostsRequest,
   DiscordChannelHistoryResult,
+  DiscordForumPostsResult,
   DiscordGatewayConfig,
   DiscordThreadCoordinates,
   GatewayConnectionTestResult,
 } from '../../types/gateway';
 import {
+  discordOutboundChannelTarget,
   isDiscordDirectMessagesEnabled,
   isDiscordSnowflake,
   isDiscordThreadCoordinates,
@@ -61,6 +65,7 @@ import {
   createDiscordReadBudget,
   type DiscordReadBudget,
   fetchDiscordChannelHistory,
+  fetchDiscordForumPosts,
   fetchDiscordProviderHistory,
   getDiscordRecordWithinBudget,
 } from './discord-history';
@@ -80,6 +85,8 @@ const DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION = PermissionFlagsBits.SendMess
 const DISCORD_MESSAGE_CONTENT_FLAGS =
   BigInt(ApplicationFlags.GatewayMessageContent) |
   BigInt(ApplicationFlags.GatewayMessageContentLimited);
+
+type DiscordHistoryRecordReader = (route: string) => Promise<Record<string, unknown> | null>;
 
 interface DiscordRestTransport {
   get(route: string, options?: { signal?: AbortSignal }): Promise<unknown>;
@@ -600,8 +607,34 @@ function toIsoTimestamp(value: unknown): string {
   return new Date().toISOString();
 }
 
-function isPublicTextChannel(channel: Record<string, unknown> | null, guildId: string): boolean {
-  if (channel?.type !== DISCORD_TEXT_CHANNEL_TYPE) return false;
+/** A forum channel: every post is a public thread whose starter lives inside it. */
+function isForumChannel(channel: Record<string, unknown> | null): boolean {
+  return channel?.type === DiscordChannelType.GuildForum;
+}
+
+function channelKind(channel: Record<string, unknown>): { kind?: 'text' | 'forum' } {
+  if (channel.type === DISCORD_TEXT_CHANNEL_TYPE) return { kind: 'text' };
+  if (isForumChannel(channel)) return { kind: 'forum' };
+  return {};
+}
+
+/** True when the configured default proactive target is one of these allowed forum channels. */
+function isForumDefaultOutboundTarget(
+  config: DiscordGatewayConfig,
+  channels: Array<{ channelId: string; channel: Record<string, unknown> | null }>
+): boolean {
+  const target = config.default_outbound_target
+    ? discordOutboundChannelTarget(config.default_outbound_target)
+    : undefined;
+  return channels.some(
+    ({ channelId, channel }) =>
+      channelId === target && channel?.id === channelId && isForumChannel(channel)
+  );
+}
+
+/** A public text or forum channel that @everyone can view. */
+function isPublicParentChannel(channel: Record<string, unknown> | null, guildId: string): boolean {
+  if (!channel || !channelKind(channel).kind) return false;
   const overwrites = channel.permission_overwrites;
   if (!Array.isArray(overwrites)) return true;
   const everyone = overwrites
@@ -826,7 +859,8 @@ export class DiscordConnector implements GatewayConnector {
     // A successful starter lookup is the accessibility proof used by the
     // listener. Discord keeps a message-started public thread's starter in
     // the parent channel, even though the thread channel id equals the starter
-    // message id. Callers must therefore verify it through the parent route.
+    // message id, so callers verify it through the parent route. A forum post's
+    // starter is the first message inside the post itself.
     return { coordinates, type: thread?.type as number };
   }
 
@@ -895,18 +929,36 @@ export class DiscordConnector implements GatewayConnector {
     }
   }
 
+  /** An allowlisted parent channel record, from the listener's cache when present. */
+  private async getAllowedParentChannel(
+    parentChannelId: string
+  ): Promise<Record<string, unknown> | null> {
+    if (!configuredChannelIds(this.config).includes(parentChannelId)) return null;
+    const cached = this.channelInfoCache.get(parentChannelId);
+    if (cached) return cached;
+    const parent = await this.getProviderRecord(Routes.channel(parentChannelId));
+    if (parent?.id !== parentChannelId) return null;
+    this.channelInfoCache.set(parentChannelId, parent);
+    return parent;
+  }
+
   private async verifyExistingPublicThread(
     threadChannelId: string,
     parentChannelId: string,
     starterMessageId: string
   ): Promise<VerifiedDiscordThread> {
-    const thread = await this.getProviderRecord(Routes.channel(threadChannelId));
+    const [thread, parent] = await Promise.all([
+      this.getProviderRecord(Routes.channel(threadChannelId)),
+      this.getAllowedParentChannel(parentChannelId),
+    ]);
     if (!thread) throw new Error('Discord public thread is inaccessible');
     const verified = await this.verifyPublicThread(thread, parentChannelId, starterMessageId);
+    if (!parent) throw new Error('Discord public thread parent is inaccessible');
+    const starterChannelId = isForumChannel(parent) ? threadChannelId : parentChannelId;
     const starter = await this.getProviderRecord(
-      Routes.channelMessage(parentChannelId, starterMessageId)
+      Routes.channelMessage(starterChannelId, starterMessageId)
     );
-    if (!starter || starter.id !== starterMessageId || starter.channel_id !== parentChannelId) {
+    if (!starter || starter.id !== starterMessageId || starter.channel_id !== starterChannelId) {
       throw new Error('Discord public thread starter message is inaccessible or malformed');
     }
     return verified;
@@ -1118,13 +1170,18 @@ export class DiscordConnector implements GatewayConnector {
   ): Promise<DiscordChannelHistoryResult> {
     this.validate();
     const budget = createDiscordReadBudget(this.config);
-    const channelId =
-      req.channelId ??
-      (req.sessionThreadKey
-        ? await this.resolveHistoryParentChannel(req.sessionThreadKey, budget)
-        : undefined);
+    const get = this.historyRecordReader(budget);
+    let channelId = req.channelId;
+    if (!channelId && req.sessionThreadKey) {
+      const session = await this.resolveHistorySessionChannels(req.sessionThreadKey, get);
+      // A forum has no messages of its own, so a forum post's session reads the post.
+      channelId =
+        session.parentIsForum && session.threadChannelId
+          ? session.threadChannelId
+          : session.parentChannelId;
+    }
     if (!channelId) throw new Error('A Discord channel or session thread is required.');
-    await this.requireChannelHistoryAccess(channelId, budget);
+    await this.requireChannelHistoryAccess(channelId, get, 'messages');
     return fetchDiscordChannelHistory(
       this.transport.historyRest,
       this.config,
@@ -1141,37 +1198,89 @@ export class DiscordConnector implements GatewayConnector {
     );
   }
 
-  /** The allowlisted parent channel behind a Discord gateway thread key. */
-  private async resolveHistoryParentChannel(
+  /** One budgeted, memoized record reader per agent read, so access checks reuse lookups. */
+  private historyRecordReader(budget: DiscordReadBudget): DiscordHistoryRecordReader {
+    const records = new Map<string, Promise<Record<string, unknown> | null>>();
+    return (route) => {
+      let record = records.get(route);
+      if (!record) {
+        record = getDiscordRecordWithinBudget(this.transport.historyRest, route, budget);
+        records.set(route, record);
+      }
+      return record;
+    };
+  }
+
+  /**
+   * List the posts of an allowlisted forum channel (`agent_tools.channel_history`).
+   * Uses the history tool's access checks and budget; a session in a forum post
+   * defaults to that post's forum.
+   */
+  async listForumPosts(req: DiscordAgentForumPostsRequest): Promise<DiscordForumPostsResult> {
+    this.validate();
+    const budget = createDiscordReadBudget(this.config);
+    const get = this.historyRecordReader(budget);
+    const channelId =
+      req.channelId ??
+      (req.sessionThreadKey
+        ? (await this.resolveHistorySessionChannels(req.sessionThreadKey, get)).parentChannelId
+        : undefined);
+    if (!channelId) throw new Error('A Discord forum channel or session thread is required.');
+    const target = await this.requireChannelHistoryAccess(channelId, get, 'forum');
+    return fetchDiscordForumPosts(
+      this.transport.historyRest,
+      this.config,
+      target,
+      {
+        channelId,
+        ...(req.archived !== undefined ? { archived: req.archived } : {}),
+        ...(req.before ? { before: req.before } : {}),
+        ...(req.limit !== undefined ? { limit: req.limit } : {}),
+      },
+      budget
+    );
+  }
+
+  /** The allowlisted parent channel (and thread, if any) behind a Discord gateway thread key. */
+  private async resolveHistorySessionChannels(
     threadKey: string,
-    budget: DiscordReadBudget
-  ): Promise<string> {
+    get: DiscordHistoryRecordReader
+  ): Promise<{ parentChannelId: string; threadChannelId?: string; parentIsForum: boolean }> {
     const parsed = parseDiscordThreadKey(threadKey);
     let parentChannelId: string | undefined;
-    if (parsed?.kind === 'legacy_thread') parentChannelId = parsed.parentChannelId;
-    else if (parsed?.kind === 'message') parentChannelId = parsed.channelId;
+    let threadChannelId: string | undefined;
+    if (parsed?.kind === 'legacy_thread') {
+      parentChannelId = parsed.parentChannelId;
+      threadChannelId = parsed.threadChannelId;
+    } else if (parsed?.kind === 'message') parentChannelId = parsed.channelId;
     else if (parsed?.kind === 'provider_thread') {
-      const thread = await getDiscordRecordWithinBudget(
-        this.transport.historyRest,
-        Routes.channel(parsed.channelId),
-        budget
-      );
+      const thread = await get(Routes.channel(parsed.channelId));
       parentChannelId = snowflake(thread?.parent_id);
+      threadChannelId = parsed.channelId;
     }
     if (!parentChannelId || !configuredChannelIds(this.config).includes(parentChannelId)) {
       throw new Error(
         'Could not resolve an allowed Discord parent channel for this session; pass discordChannelId.'
       );
     }
-    return parentChannelId;
+    const parentIsForum =
+      threadChannelId !== undefined && isForumChannel(await get(Routes.channel(parentChannelId)));
+    return {
+      parentChannelId,
+      ...(threadChannelId ? { threadChannelId } : {}),
+      parentIsForum,
+    };
   }
 
+  /**
+   * Resolve and authorize a history target of the expected kind (a channel or
+   * thread with messages, or a forum to list), returning its channel record.
+   */
   private async requireChannelHistoryAccess(
     channelId: string,
-    budget: DiscordReadBudget
-  ): Promise<void> {
-    const get = (route: string) =>
-      getDiscordRecordWithinBudget(this.transport.historyRest, route, budget);
+    get: DiscordHistoryRecordReader,
+    kind: 'messages' | 'forum'
+  ): Promise<Record<string, unknown>> {
     const guildId = configuredString(this.config, 'guild_id');
     const allowedChannelIds = configuredChannelIds(this.config);
     const denied = () =>
@@ -1194,7 +1303,18 @@ export class DiscordConnector implements GatewayConnector {
       parent = await get(Routes.channel(parentChannelId));
       if (parent?.id !== parentChannelId || parent.guild_id !== guildId) throw denied();
     }
-    if (!isPublicTextChannel(parent, guildId)) throw denied();
+    if (!isPublicParentChannel(parent, guildId)) throw denied();
+    // Checked after the allowlist so a denial never reveals a channel's kind.
+    if (kind === 'messages' && isForumChannel(target)) {
+      throw new Error(
+        `Discord channel ${channelId} is a forum, which has no messages of its own; pass a post (thread) ID instead.`
+      );
+    }
+    if (kind === 'forum' && !isForumChannel(target)) {
+      throw new Error(
+        `Discord channel ${channelId} is not a forum channel; pass an allowed forum channel ID.`
+      );
+    }
 
     // Threads inherit their parent's permission overwrites.
     const botUserId = configuredString(this.config, 'application_id');
@@ -1209,6 +1329,7 @@ export class DiscordConnector implements GatewayConnector {
         `The Discord bot lacks View Channel or Read Message History on channel ${channelId}; grant both in Discord to read its history.`
       );
     }
+    return target;
   }
 
   async sendDirectMessage(req: {
@@ -1495,13 +1616,28 @@ export class DiscordConnector implements GatewayConnector {
         (configuredChannel, index) =>
           configuredChannel?.id !== allowedChannelIds[index] ||
           configuredChannel?.guild_id !== configuredString(this.config, 'guild_id') ||
-          !isPublicTextChannel(configuredChannel, configuredString(this.config, 'guild_id'))
+          !isPublicParentChannel(configuredChannel, configuredString(this.config, 'guild_id'))
       )
     ) {
       throw new GatewayListenerError(
         'discord_channel_invalid',
         'permanent',
-        'Every allowed Discord channel must be a public text channel.'
+        'Every allowed Discord channel must be a public text or forum channel.'
+      );
+    }
+    if (
+      isForumDefaultOutboundTarget(
+        this.config,
+        configuredChannels.map((channel, index) => ({
+          channelId: allowedChannelIds[index]!,
+          channel,
+        }))
+      )
+    ) {
+      throw new GatewayListenerError(
+        'discord_outbound_target_invalid',
+        'permanent',
+        'The default proactive target must be a text channel; forum channels cannot receive proactive messages.'
       );
     }
     configuredChannels.forEach((channel, index) => {
@@ -1639,19 +1775,25 @@ export class DiscordConnector implements GatewayConnector {
           configuredString(this.config, 'guild_id'),
           botUserId ?? ''
         );
-        const publicText =
+        const publicParent =
           channel?.id === channelId &&
           channel?.guild_id === configuredString(this.config, 'guild_id') &&
-          isPublicTextChannel(channel, configuredString(this.config, 'guild_id'));
-        const required =
-          DISCORD_VIEW_CHANNEL_PERMISSION |
-          DISCORD_SEND_MESSAGES_PERMISSION |
-          DISCORD_READ_MESSAGE_HISTORY_PERMISSION |
-          DISCORD_CREATE_PUBLIC_THREADS_PERMISSION |
-          DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION;
+          isPublicParentChannel(channel, configuredString(this.config, 'guild_id'));
+        const forum = isForumChannel(channel);
+        // Forum posts are created by members; the bot only reads and replies in them.
+        const required = forum
+          ? DISCORD_VIEW_CHANNEL_PERMISSION |
+            DISCORD_READ_MESSAGE_HISTORY_PERMISSION |
+            DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION
+          : DISCORD_VIEW_CHANNEL_PERMISSION |
+            DISCORD_SEND_MESSAGES_PERMISSION |
+            DISCORD_READ_MESSAGE_HISTORY_PERMISSION |
+            DISCORD_CREATE_PUBLIC_THREADS_PERMISSION |
+            DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION;
         return {
           channelId,
-          ok: publicText && (permissions & required) === required,
+          ...(channel?.id === channelId ? channelKind(channel) : {}),
+          ok: publicParent && (permissions & required) === required,
           permissions: {
             view: (permissions & DISCORD_VIEW_CHANNEL_PERMISSION) !== 0n,
             send: (permissions & DISCORD_SEND_MESSAGES_PERMISSION) !== 0n,
@@ -1661,6 +1803,7 @@ export class DiscordConnector implements GatewayConnector {
           },
         };
       });
+      const forumOutboundTarget = isForumDefaultOutboundTarget(this.config, channels);
       const failures = [
         ...(botOk
           ? []
@@ -1685,9 +1828,18 @@ export class DiscordConnector implements GatewayConnector {
               {
                 capability: 'channel_access',
                 reason:
-                  'One or more allowed channels is not public text or lacks view, send, history, public-thread creation, or thread-reply permission.',
+                  'One or more allowed channels is not a public text or forum channel, or lacks a required permission: view, history, and thread replies everywhere; send and public-thread creation in text channels.',
               },
             ]),
+        ...(forumOutboundTarget
+          ? [
+              {
+                capability: 'outbound_target',
+                reason:
+                  'The default proactive target is a forum channel, which cannot receive proactive messages.',
+              },
+            ]
+          : []),
         ...(messageContent === false
           ? [
               {
