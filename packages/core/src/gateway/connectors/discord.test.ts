@@ -3,6 +3,8 @@ import { GatewayCloseCodes, GatewayIntentBits, PermissionFlagsBits } from 'disco
 import { describe, expect, it, vi } from 'vitest';
 import {
   type DiscordMessageDeliveryID,
+  discordOutboundChannelTarget,
+  previousDiscordSnowflake,
   resolveDiscordAgentTools,
   validateDiscordConfig,
 } from '../../types/gateway';
@@ -284,6 +286,20 @@ describe('Discord connector beta', () => {
         allowed_role_ids: ['555555555555555555'],
       }).errors
     ).toContain('allowed_user_ids must contain only Discord snowflakes');
+  });
+
+  it('parses proactive channel targets and decrements Snowflakes exactly', () => {
+    expect(discordOutboundChannelTarget(' channel:333333333333333333 ')).toBe('333333333333333333');
+    for (const target of [
+      'user:333333333333333333',
+      'channel:123',
+      'channel:333333333333333333x',
+    ]) {
+      expect(discordOutboundChannelTarget(target)).toBeUndefined();
+    }
+    expect(previousDiscordSnowflake('9223372036854775807')).toBe('9223372036854775806');
+    expect(previousDiscordSnowflake('100000000000000000')).toBe('99999999999999999');
+    expect(() => previousDiscordSnowflake('01')).toThrow('canonical Snowflake');
   });
 
   it('accepts the legacy empty agent_tools and the channel_history toggle only', () => {
@@ -1974,6 +1990,42 @@ describe('Discord forum channels', () => {
     await connector.stopListening();
   });
 
+  it('admits a mention in the opening message of a forum post', async () => {
+    const { transport, rest, dispatch } = forumTransport();
+    const connector = new DiscordConnector(forumConfig, transport as never);
+    const received: unknown[] = [];
+    await connector.startListening(async (message) => {
+      received.push(message);
+    });
+    dispatch()?.(
+      {
+        t: 'MESSAGE_CREATE',
+        s: 1,
+        d: {
+          id: postId,
+          guild_id: config.guild_id,
+          channel_id: postId,
+          type: 0,
+          content: `<@${config.application_id}> the build fails`,
+          author: { id: '444444444444444444', bot: false },
+          member: { roles: [] },
+          mentions: [{ id: config.application_id }],
+        },
+      },
+      0
+    );
+    await (connector as unknown as { dispatchChain: Promise<void> }).dispatchChain;
+
+    expect(received[0]).toMatchObject({ threadId: `discord:thread:${forumId}:${postId}` });
+    await expect(
+      (received[0] as { prepareDelivery: () => Promise<Record<string, unknown>> }).prepareDelivery()
+    ).resolves.toMatchObject({
+      discord_thread: { thread_channel_id: postId, starter_message_id: postId },
+    });
+    expect(rest.get).toHaveBeenCalledWith(`/channels/${postId}/messages/${postId}`);
+    await connector.stopListening();
+  });
+
   it('still refuses a forum that @everyone cannot view', async () => {
     const { transport } = forumTransport({
       permission_overwrites: [
@@ -1992,6 +2044,28 @@ describe('Discord forum channels', () => {
     await expect(
       new DiscordConnector(config, transport as never).startListening(vi.fn())
     ).rejects.toMatchObject({ code: 'discord_outbound_target_invalid' });
+  });
+
+  it('ignores a leftover forum default target while outbound is off', async () => {
+    const { transport } = forumTransport();
+    const outboundOff = { ...config, outbound_enabled: false };
+    await expect(
+      new DiscordConnector(outboundOff, transport as never).testConnection()
+    ).resolves.toMatchObject({ ok: true, failures: [] });
+    const connector = new DiscordConnector(outboundOff, transport as never);
+    await expect(connector.startListening(vi.fn())).resolves.toBeUndefined();
+    await connector.stopListening();
+  });
+
+  it('refuses an explicit proactive send to a forum before calling Discord', async () => {
+    const { transport, rest } = forumTransport();
+    await expect(
+      new DiscordConnector(forumConfig, transport as never).sendDirectMessage({
+        target: `channel:${forumId}`,
+        text: 'hello',
+      })
+    ).rejects.toThrow('forum channels cannot receive proactive messages');
+    expect(rest.post).not.toHaveBeenCalled();
   });
 
   it('probes a forum with reply permissions and flags a forum proactive target', async () => {
@@ -2017,6 +2091,13 @@ describe('Discord forum channels', () => {
     await expect(
       connector.fetchChannelHistory({ sessionThreadKey: `discord:thread:${forumId}:${postId}` })
     ).resolves.toMatchObject({ channelId: postId });
+    // Production sessions key a thread by its bare provider snowflake.
+    await expect(
+      connector.fetchChannelHistory({ sessionThreadKey: postId })
+    ).resolves.toMatchObject({ channelId: postId });
+    await expect(connector.listForumPosts({ sessionThreadKey: postId })).resolves.toMatchObject({
+      channelId: forumId,
+    });
     await expect(connector.fetchChannelHistory({ channelId: forumId })).rejects.toThrow(
       'is a forum, which has no messages of its own'
     );

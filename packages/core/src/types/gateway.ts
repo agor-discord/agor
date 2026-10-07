@@ -751,11 +751,14 @@ export interface GatewayConnectionTestPermissionDetails {
   sendInThreads: boolean;
 }
 
+/** Kinds of Discord channel an allowlist may name: text, or forum (whose posts are threads). */
+export type DiscordParentChannelKind = 'text' | 'forum';
+
 /** Access result for one configured provider channel. */
 export interface GatewayConnectionTestChannelAccess {
   channelId: string;
   /** Discord only, when the channel is a supported kind. */
-  kind?: 'text' | 'forum';
+  kind?: DiscordParentChannelKind;
   ok: boolean;
   permissions?: GatewayConnectionTestPermissionDetails;
 }

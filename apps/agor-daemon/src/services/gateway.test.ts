@@ -3401,6 +3401,66 @@ describe('GatewayService Discord beta routing', () => {
     );
   });
 
+  it('admits a forum post whose opening message is the summon without duplicating it', async () => {
+    const postId = '723456789012345678';
+    const connector = {
+      sendMessage: vi.fn(async () => undefined),
+      fetchProviderHistory: vi.fn(async () => ({
+        threadId: postId,
+        complete: true,
+        messages: [
+          {
+            providerMessageId: postId,
+            timestamp: '2026-08-20T12:00:00.000Z',
+            actorLabel: 'summoner',
+            text: 'opening summon',
+            isBot: false,
+            isSystem: false,
+            isRich: false,
+            isTrigger: true,
+            isMention: true,
+          },
+        ],
+      })),
+    };
+    const harness = makeGatewayHarness({ channel: discordChannel, connector });
+    const inbound = validDiscordInbound();
+    inbound.thread_id = postId;
+    inbound.text = 'opening summon';
+    inbound.metadata = {
+      ...inbound.metadata,
+      discord_message_id: postId,
+      discord_channel_id: postId,
+      discord_parent_channel_id: '323456789012345678',
+      discord_is_thread: true,
+      discord_thread_id: postId,
+      discord_thread: {
+        guild_id: '223456789012345678',
+        parent_channel_id: '323456789012345678',
+        thread_channel_id: postId,
+        starter_message_id: postId,
+      },
+      discord_thread_type: 11,
+      discord_thread_accessible: true,
+      discord_starter_message_accessible: true,
+    };
+
+    await expect(harness.service.create(inbound)).resolves.toMatchObject({ success: true });
+    expect(connector.fetchProviderHistory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: postId,
+        afterProviderCursor: '723456789012345677',
+        throughProviderCursor: postId,
+      })
+    );
+    const prompt = harness.promptCreate.mock.calls[0][0].prompt as string;
+    expect(prompt.split('opening summon')).toHaveLength(2);
+    expect(harness.threadMapRepo.advanceDiscordLastAdmittedMessageId).toHaveBeenCalledWith(
+      'map-new',
+      postId
+    );
+  });
+
   it('reads a new summon boundary from its parent before later catch-up moves to the thread', async () => {
     const connector = {
       sendMessage: vi.fn(async () => undefined),

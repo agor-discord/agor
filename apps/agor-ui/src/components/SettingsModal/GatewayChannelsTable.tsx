@@ -1909,8 +1909,8 @@ const DiscordSetupFields: React.FC<{
             />
           </Form.Item>
           <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-            Proactive sends target an allowlisted parent channel and create a durable seed. The
-            first human reply consumes that seed; it does not create a summon thread.
+            Proactive sends target an allowlisted text channel and create a durable seed. The first
+            human reply consumes that seed; it does not create a summon thread.
           </Typography.Text>
           <Form.Item
             label="Enable proactive outbound"

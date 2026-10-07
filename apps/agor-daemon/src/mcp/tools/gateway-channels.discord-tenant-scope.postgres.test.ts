@@ -202,6 +202,7 @@ describe.skipIf(!postgresUrl || !usesPostgresSchema)(
         has_more: false,
         next_cursor: null,
       }));
+      vi.mocked(getConnector).mockClear();
       vi.mocked(getConnector).mockReturnValue({ listForumPosts } as never);
       const forumTool = 'agor_gateway_discord_forum_posts_list';
 

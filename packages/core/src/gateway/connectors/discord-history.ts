@@ -681,8 +681,9 @@ function toForumPost(
  * budget. Active posts come from the guild's active-thread list (cursor: post
  * ID); archived posts page through Discord's public archive (cursor: archive
  * timestamp, exclusive as in Discord's API, so posts archived at the exact same
- * instant across a page boundary can be skipped). Titles are untrusted user content. Access and allowlist checks
- * belong to the caller, which passes the already-fetched forum record.
+ * instant across a page boundary can be skipped). Titles are untrusted user
+ * content. Access and allowlist checks belong to the caller, which passes the
+ * already-fetched forum record.
  */
 export async function fetchDiscordForumPosts(
   rest: DiscordHistoryRestTransport,

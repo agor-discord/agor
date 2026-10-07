@@ -27,6 +27,7 @@ import type {
   DiscordChannelHistoryResult,
   DiscordForumPostsResult,
   DiscordGatewayConfig,
+  DiscordParentChannelKind,
   DiscordThreadCoordinates,
   GatewayConnectionTestResult,
 } from '../../types/gateway';
@@ -71,8 +72,12 @@ import {
 } from './discord-history';
 
 const DISCORD_MESSAGE_LIMIT = 2000;
-const DISCORD_TEXT_CHANNEL_TYPE = 0;
-const DISCORD_PUBLIC_THREAD_TYPES = new Set([10, 11]);
+const DISCORD_TEXT_CHANNEL_TYPE = DiscordChannelType.GuildText;
+const DISCORD_FORUM_CHANNEL_TYPE = DiscordChannelType.GuildForum;
+const DISCORD_PUBLIC_THREAD_TYPES = new Set<number>([
+  DiscordChannelType.AnnouncementThread,
+  DiscordChannelType.PublicThread,
+]);
 const DISCORD_TEXT_MESSAGE_TYPES = new Set([0, 19]);
 const DISCORD_NONCE_RECOVERY_WINDOW_MS = 5 * 60_000;
 const DISCORD_ADMINISTRATOR_PERMISSION = PermissionFlagsBits.Administrator;
@@ -609,23 +614,27 @@ function toIsoTimestamp(value: unknown): string {
 
 /** A forum channel: every post is a public thread whose starter lives inside it. */
 function isForumChannel(channel: Record<string, unknown> | null): boolean {
-  return channel?.type === DiscordChannelType.GuildForum;
+  return channel?.type === DISCORD_FORUM_CHANNEL_TYPE;
 }
 
-function channelKind(channel: Record<string, unknown>): { kind?: 'text' | 'forum' } {
-  if (channel.type === DISCORD_TEXT_CHANNEL_TYPE) return { kind: 'text' };
-  if (isForumChannel(channel)) return { kind: 'forum' };
-  return {};
+function channelKind(
+  channel: Record<string, unknown> | null
+): DiscordParentChannelKind | undefined {
+  if (channel?.type === DISCORD_TEXT_CHANNEL_TYPE) return 'text';
+  if (isForumChannel(channel)) return 'forum';
+  return undefined;
 }
 
-/** True when the configured default proactive target is one of these allowed forum channels. */
+/** True when outbound is on and its default target is one of these allowed forum channels. */
 function isForumDefaultOutboundTarget(
   config: DiscordGatewayConfig,
   channels: Array<{ channelId: string; channel: Record<string, unknown> | null }>
 ): boolean {
-  const target = config.default_outbound_target
-    ? discordOutboundChannelTarget(config.default_outbound_target)
-    : undefined;
+  const target =
+    config.outbound_enabled === true && config.default_outbound_target
+      ? discordOutboundChannelTarget(config.default_outbound_target)
+      : undefined;
+  if (!target) return false;
   return channels.some(
     ({ channelId, channel }) =>
       channelId === target && channel?.id === channelId && isForumChannel(channel)
@@ -634,7 +643,7 @@ function isForumDefaultOutboundTarget(
 
 /** A public text or forum channel that @everyone can view. */
 function isPublicParentChannel(channel: Record<string, unknown> | null, guildId: string): boolean {
-  if (!channel || !channelKind(channel).kind) return false;
+  if (!channel || !channelKind(channel)) return false;
   const overwrites = channel.permission_overwrites;
   if (!Array.isArray(overwrites)) return true;
   const everyone = overwrites
@@ -947,12 +956,10 @@ export class DiscordConnector implements GatewayConnector {
     parentChannelId: string,
     starterMessageId: string
   ): Promise<VerifiedDiscordThread> {
-    const [thread, parent] = await Promise.all([
-      this.getProviderRecord(Routes.channel(threadChannelId)),
-      this.getAllowedParentChannel(parentChannelId),
-    ]);
+    const thread = await this.getProviderRecord(Routes.channel(threadChannelId));
     if (!thread) throw new Error('Discord public thread is inaccessible');
     const verified = await this.verifyPublicThread(thread, parentChannelId, starterMessageId);
+    const parent = await this.getAllowedParentChannel(parentChannelId);
     if (!parent) throw new Error('Discord public thread parent is inaccessible');
     const starterChannelId = isForumChannel(parent) ? threadChannelId : parentChannelId;
     const starter = await this.getProviderRecord(
@@ -1373,6 +1380,13 @@ export class DiscordConnector implements GatewayConnector {
       channelId = dmId;
     } else if (!configuredChannelIds(this.config).includes(channelId)) {
       throw new Error('Discord outbound target must be one of the allowed channels');
+    } else if (
+      // Best effort: a failed lookup leaves the provider to refuse a forum target.
+      isForumChannel(await this.getAllowedParentChannel(channelId).catch(() => null))
+    ) {
+      throw new Error(
+        'Discord forum channels cannot receive proactive messages; target an allowed text channel'
+      );
     }
     const ids: string[] = [];
     for (const chunk of chunkDiscordMessage(req.text)) {
@@ -1779,20 +1793,21 @@ export class DiscordConnector implements GatewayConnector {
           channel?.id === channelId &&
           channel?.guild_id === configuredString(this.config, 'guild_id') &&
           isPublicParentChannel(channel, configuredString(this.config, 'guild_id'));
-        const forum = isForumChannel(channel);
+        const kind = channel?.id === channelId ? channelKind(channel) : undefined;
         // Forum posts are created by members; the bot only reads and replies in them.
-        const required = forum
-          ? DISCORD_VIEW_CHANNEL_PERMISSION |
-            DISCORD_READ_MESSAGE_HISTORY_PERMISSION |
-            DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION
-          : DISCORD_VIEW_CHANNEL_PERMISSION |
-            DISCORD_SEND_MESSAGES_PERMISSION |
-            DISCORD_READ_MESSAGE_HISTORY_PERMISSION |
-            DISCORD_CREATE_PUBLIC_THREADS_PERMISSION |
-            DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION;
+        const required =
+          kind === 'forum'
+            ? DISCORD_VIEW_CHANNEL_PERMISSION |
+              DISCORD_READ_MESSAGE_HISTORY_PERMISSION |
+              DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION
+            : DISCORD_VIEW_CHANNEL_PERMISSION |
+              DISCORD_SEND_MESSAGES_PERMISSION |
+              DISCORD_READ_MESSAGE_HISTORY_PERMISSION |
+              DISCORD_CREATE_PUBLIC_THREADS_PERMISSION |
+              DISCORD_SEND_MESSAGES_IN_THREADS_PERMISSION;
         return {
           channelId,
-          ...(channel?.id === channelId ? channelKind(channel) : {}),
+          ...(kind ? { kind } : {}),
           ok: publicParent && (permissions & required) === required,
           permissions: {
             view: (permissions & DISCORD_VIEW_CHANNEL_PERMISSION) !== 0n,
