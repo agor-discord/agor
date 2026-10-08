@@ -803,8 +803,11 @@ function formatDiscordUnreadAttachment(name: string, reason: string): string {
  * Prompt note naming the attachments the agent could not read. The user must
  * hear about them, so it overrides the option to stay silent.
  */
-function formatDiscordUnreadAttachmentsNote(unread: string[]): string {
-  return `(Attachments you could not read: ${unread.join('; ')}. Tell the user which files you could not read, even if you would otherwise stay silent. Images (PNG, JPEG, GIF, WebP) and text files (.txt, .log, .md, .csv, .json) can be read; suggest one of those or pasting the text.)`;
+function formatDiscordUnreadAttachmentsNote(unread: string[], filesEnabled: boolean): string {
+  const hint = filesEnabled
+    ? 'Images (PNG, JPEG, GIF, WebP) and text files (.txt, .log, .md, .csv, .json) can be read; suggest one of those or pasting the text.'
+    : 'Attachments are turned off for this channel; suggest pasting the text instead.';
+  return `(Attachments you could not read: ${unread.join('; ')}. Tell the user which files you could not read, even if you would otherwise stay silent. ${hint})`;
 }
 
 /** Prompt note for a Discord message admitted by a response mode without a mention. */
@@ -6121,7 +6124,7 @@ export class GatewayService {
           }
         }
         if (unread.length > 0) {
-          promptText = `${promptText}\n\n${formatDiscordUnreadAttachmentsNote(unread)}`;
+          promptText = `${promptText}\n\n${formatDiscordUnreadAttachmentsNote(unread, channelConfig.files === true)}`;
         }
       }
 

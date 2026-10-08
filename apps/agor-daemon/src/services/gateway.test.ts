@@ -3380,6 +3380,37 @@ describe('GatewayService Discord beta routing', () => {
     expect(prompt).toContain(
       `"${discordInboundFiles[0].name}" (attachments are turned off for this channel)`
     );
+    expect(prompt).toContain('suggest pasting the text instead');
+    expect(prompt).not.toContain('can be read');
+  });
+
+  it('hands Discord skipped attachments from the listener to the prompt path', async () => {
+    const service = new GatewayService({ run: vi.fn() } as never, { service: vi.fn() } as never);
+    const create = vi
+      .spyOn(service, 'create')
+      .mockResolvedValue({ success: true, sessionId: 'sess-1', created: false });
+    const skippedFiles = [{ name: 'report.pdf', reason: 'unsupported_type' }];
+
+    await (
+      service as unknown as {
+        handleListenerInboundMessage(
+          channel: GatewayChannel,
+          tenantId: string | undefined,
+          msg: Record<string, unknown>
+        ): Promise<void>;
+      }
+    ).handleListenerInboundMessage(
+      { ...discordChannel, tenant_id: 'tenant-channel' } as GatewayChannel,
+      'tenant-channel',
+      {
+        threadId: validDiscordInbound().thread_id,
+        text: 'hello',
+        userId: '423456789012345678',
+        skippedFiles,
+      }
+    );
+
+    expect(create.mock.calls[0][0]).toMatchObject({ skipped_files: skippedFiles });
   });
 
   it('writes a new Discord mapping with the verified provider thread Snowflake', async () => {
