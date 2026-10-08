@@ -793,7 +793,7 @@ const DISCORD_SKIPPED_FILE_REASON: Record<InboundSkippedFile['reason'], string> 
  */
 function formatDiscordUnreadAttachment(name: string, reason: string): string {
   const safeName = name
-    .replace(/[\p{Cc}<>`]/gu, ' ')
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}<>`]/gu, ' ')
     .trim()
     .slice(0, 100);
   return `${JSON.stringify(safeName || 'attachment')} (${reason})`;
