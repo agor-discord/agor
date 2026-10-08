@@ -243,9 +243,12 @@ export function isDiscordNoReply(text: string): boolean {
   const trimmed = text.trim();
   // Only a short reply can be the marker; never run the regex on long output.
   if (trimmed.length > DISCORD_NO_REPLY_SENTINEL.length + 16) return false;
-  // Tolerate Markdown, code-fence, quote, or blockquote wrappers and a trailing period.
+  // Tolerate Markdown, code-fence (with a language tag), quote, or blockquote wrappers and a trailing period.
   return (
-    trimmed.replace(/^[`*_~"'>\s]+|[`*_~"'.\s]+$/g, '').toLowerCase() === DISCORD_NO_REPLY_SENTINEL
+    trimmed
+      .replace(/^```[a-z]*\s+/i, '')
+      .replace(/^[`*_~"'>\s]+|[`*_~"'.\s]+$/g, '')
+      .toLowerCase() === DISCORD_NO_REPLY_SENTINEL
   );
 }
 

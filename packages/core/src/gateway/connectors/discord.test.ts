@@ -2216,11 +2216,18 @@ describe('Discord response modes', () => {
       '_[no-reply]_',
       '"[no-reply]"',
       '```\n[no-reply]\n```',
+      '```text\n[no-reply]\n```',
       '> [no-reply]',
     ]) {
       expect(isDiscordNoReply(text)).toBe(true);
     }
-    for (const text of ['no-reply', '[no-reply] thanks', 'Reply: [no-reply]', ' '.repeat(80_000)]) {
+    for (const text of [
+      'no-reply',
+      '[no-reply] thanks',
+      'Reply: [no-reply]',
+      '```js\nreply()\n```',
+      ' '.repeat(80_000),
+    ]) {
       expect(isDiscordNoReply(text)).toBe(false);
     }
   });
